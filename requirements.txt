@@ -1,9 +1,7 @@
-@'
-streamlit
-pandas
-numpy
-scikit-learn
-joblib
-requests
-tqdm
-'@ | Out-File -Encoding UTF8 requirements.txt
+streamlit==1.37.1
+pandas==2.2.2
+numpy==1.26.4            # ← 安定版（NumPy 2 系は一部ライブラリが未対応）
+scikit-learn==1.4.2
+joblib==1.3.2
+requests==2.32.3
+tqdm==4.66.4
