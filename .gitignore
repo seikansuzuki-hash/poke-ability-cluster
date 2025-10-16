@@ -1,0 +1,7 @@
+@'
+__pycache__/
+*.pyc
+.venv/
+pokemon_raw_cache.csv
+ability_clusters.joblib.backup
+'@ | Out-File -Encoding UTF8 .gitignore
