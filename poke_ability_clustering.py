@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # poke_ability_clustering.py
-#  - PokeAPIから取得 → 特徴量化 → PCA+KMeansクラスタリング（K自動探索）
+#  - PokeAPIから取得 → 特徴量化 → 重み付き(Standardize→Weighting)→ PCA → KMeans（K自動探索）
 #  - クラスタごとの特性分布から新キャラの「推奨特性TOPk」を返す
 #  - 日本語出力対応（特性名 / ポケモン名）：out_lang="ja" or "ja-Hrkt"
 # 依存:
@@ -30,6 +30,18 @@ TYPE_ORDER = [
     "normal","fire","water","electric","grass","ice","fighting","poison","ground",
     "flying","psychic","bug","rock","ghost","dragon","dark","steel","fairy"
 ]
+
+# ------------------------------
+# 好みの重み（タイプ > タマゴ > 体格 > 種族値 > 世代）
+# 数値は調整OK：大きいほど距離への寄与が大きい
+# ------------------------------
+WEIGHTS = {
+    "type": 3.0,   # タイプが最重要
+    "egg":  2.0,   # タマゴ
+    "phys": 1.5,   # 体格（weight, height, base_experience, capture_rate）
+    "stats":1.0,   # 種族値（hp, attack, ...）
+    "gen":  0.8,   # 世代
+}
 
 # ------------------------------
 # 0) Utilities (retry / sleep)
@@ -141,6 +153,36 @@ def make_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     return X, meta
 
 # ------------------------------
+# 2.1) 列グループ化 & 重みベクトル生成
+# ------------------------------
+def feature_groups_from_columns(cols: List[str]) -> Dict[str, List[str]]:
+    num_stats = ["hp","attack","defense","sp_attack","sp_defense","speed"]
+    phys_cols = ["weight","height","base_experience","capture_rate"]
+    groups = {"type":[], "egg":[], "phys":[], "stats":[], "gen":[]}
+    for c in cols:
+        if c.startswith("type_"):
+            groups["type"].append(c)
+        elif c.startswith("egg_"):
+            groups["egg"].append(c)
+        elif c.startswith("gen_"):
+            groups["gen"].append(c)
+        elif c in phys_cols:
+            groups["phys"].append(c)
+        elif c in num_stats:
+            groups["stats"].append(c)
+    return groups
+
+def make_column_weights(feature_cols: List[str], weights_cfg: Dict[str, float]) -> np.ndarray:
+    groups = feature_groups_from_columns(feature_cols)
+    w = np.ones(len(feature_cols), dtype=float)
+    name_to_idx = {c:i for i,c in enumerate(feature_cols)}
+    for gname, cols in groups.items():
+        gweight = float(weights_cfg.get(gname, 1.0))
+        for c in cols:
+            w[name_to_idx[c]] = gweight
+    return w
+
+# ------------------------------
 # 2.5) Localization helpers (Japanese output)
 # ------------------------------
 L10N_CACHE: Dict[Tuple[str, str, str], str] = {}
@@ -183,21 +225,26 @@ def get_pokemon_ja(name_en: str, lang: str = "ja") -> str:
     return ja
 
 # ------------------------------
-# 3) Clustering with K auto-select
+# 3) Clustering with K auto-select (重み対応)
 # ------------------------------
-def fit_clustering(X: pd.DataFrame, k_min=8, k_max=30, pca_dim=20, seed=42):
+def fit_clustering(X: pd.DataFrame, k_min=8, k_max=30, pca_dim=20, seed=42, col_weights: Optional[np.ndarray]=None):
     scaler = StandardScaler()
     Xs = scaler.fit_transform(X)
 
+    # --- 標準化後に重み付け（列方向に乗算）---
+    if col_weights is None:
+        col_weights = np.ones(Xs.shape[1], dtype=float)
+    Xw = Xs * col_weights
+
     # PCA（速度とノイズ低減）
-    pca = PCA(n_components=min(pca_dim, Xs.shape[1]))
-    Z = pca.fit_transform(Xs)
+    pca = PCA(n_components=min(pca_dim, Xw.shape[1]))
+    Z = pca.fit_transform(Xw)
 
     # K探索（silhouette最大）
     best_k, best_score, best_model = None, -1, None
     for k in range(k_min, min(k_max, len(X))):
         try:
-            km = KMeans(n_clusters=k, random_state=seed, n_init=10)  # 互換性のため n_init=10
+            km = KMeans(n_clusters=k, random_state=seed, n_init=10)  # n_init=10 for compatibility
             labels = km.fit_predict(Z)
             if len(set(labels)) < 2:
                 continue
@@ -222,7 +269,8 @@ def fit_clustering(X: pd.DataFrame, k_min=8, k_max=30, pca_dim=20, seed=42):
         "kmeans": best_model,
         "labels": labels,
         "embedding": Z,
-        "silhouette": float(best_score)
+        "silhouette": float(best_score),
+        "col_weights": col_weights,  # 保存して推論でも使用
     }
 
 def summarize_clusters(model_bundle: Dict, X: pd.DataFrame, meta: pd.DataFrame) -> List[Dict]:
@@ -267,7 +315,7 @@ def load_artifacts(path="ability_clusters.joblib"):
     return joblib.load(path)
 
 # ------------------------------
-# 5) Inference for a new Pokémon
+# 5) Inference for a new Pokémon（重み対応）
 # ------------------------------
 def build_row_from_features(feat: dict, feature_cols: List[str]) -> pd.DataFrame:
     # feature_cols は学習時の列順
@@ -303,18 +351,24 @@ def predict_cluster_and_abilities(new_feat: dict, artifacts_path="ability_cluste
     pca = bundle["pca"]
     kmeans = bundle["kmeans"]
     clusters = bundle["clusters"] # プロファイル
+    col_weights = bundle.get("col_weights", np.ones(len(feature_cols), dtype=float))
 
+    # --- 新規個体に同じ前処理（標準化→重み付け→PCA）---
     X_new = build_row_from_features(new_feat, feature_cols)
-    Z_new = pca.transform(scaler.transform(X_new))[0]
+    Xn = scaler.transform(X_new)
+    Xn_w = Xn * col_weights
+    Z_new = pca.transform(Xn_w)[0]
     label = int(kmeans.predict([Z_new])[0])
 
     # クラスターの特性上位
     cluster_info = next((c for c in clusters if c["cluster_id"] == label), None)
     top_abilities = cluster_info["top_abilities"][:topk] if cluster_info else []
 
-    # 近傍個体（参考提示）
+    # 近傍個体（参考提示）: 学習側も重み→PCAの空間で探索
     nn = NearestNeighbors(n_neighbors=min(10, len(X)), metric="euclidean")
-    Z_all = pca.transform(scaler.transform(X))
+    X_all_scaled = scaler.transform(X)
+    X_all_w = X_all_scaled * col_weights
+    Z_all = pca.transform(X_all_w)
     nn.fit(Z_all)
     dists, idxs = nn.kneighbors([Z_new], return_distance=True)
     neighbors = []
@@ -355,7 +409,11 @@ def main():
     # 学習
     df = build_dataset()
     X, meta = make_features(df)
-    model_bundle = fit_clustering(X, k_min=8, k_max=30, pca_dim=20, seed=42)
+
+    # 列ごとの重みベクトルを作成
+    col_weights = make_column_weights(list(X.columns), WEIGHTS)
+
+    model_bundle = fit_clustering(X, k_min=8, k_max=30, pca_dim=20, seed=42, col_weights=col_weights)
     clusters = summarize_clusters(model_bundle, X, meta)
 
     # 保存（推論に必要な最小限＋解釈用情報）
@@ -366,7 +424,9 @@ def main():
         "pca": model_bundle["pca"],
         "kmeans": model_bundle["kmeans"],
         "clusters": clusters,
-        "silhouette": model_bundle["silhouette"]
+        "silhouette": model_bundle["silhouette"],
+        "col_weights": model_bundle["col_weights"],  # 追加
+        "weights_cfg": WEIGHTS,                      # 参考として設定も保存
     }
     save_artifacts("ability_clusters.joblib", **artifacts)
 
