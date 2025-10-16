@@ -5,6 +5,16 @@ import sys, os, pathlib, importlib, traceback
 st.set_page_config(page_title="診断: poke-ability-cluster", layout="wide")
 st.title("🔎 診断: Streamlit Cloud 起動トラブル")
 
+
+with st.expander("requirements.txt の中身（先頭200文字）", expanded=True):
+    try:
+        txt = pathlib.Path("requirements.txt").read_text(encoding="utf-8", errors="ignore")
+        st.code(txt[:200] + ("\n...（省略）" if len(txt) > 200 else ""))
+    except Exception as e:
+        st.error("requirements.txt を読めませんでした")
+        st.exception(e)
+
+
 # 1) Python/依存バージョンを表示
 with st.expander("Python & ライブラリ情報", expanded=True):
     import platform

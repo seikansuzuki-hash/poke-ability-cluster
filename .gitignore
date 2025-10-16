@@ -1,7 +1,14 @@
 @'
+# virtual envs
+.venv/
+.cloudvenv/
+venv/
+
+# caches
 __pycache__/
 *.pyc
-.venv/
+.ipynb_checkpoints/
+.DS_Store
+# data/cache
 pokemon_raw_cache.csv
-ability_clusters.joblib.backup
 '@ | Out-File -Encoding UTF8 .gitignore
